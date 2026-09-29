@@ -21,7 +21,7 @@ export default {
           950: '#020617',
         },
         primary: {
-          DEFAULT: '#0284c7', // aerospace sky/blue
+          DEFAULT: '#0284c7',
           hover: '#0369a1',
           light: '#e0f2fe',
         },
