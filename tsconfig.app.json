@@ -7,7 +7,6 @@
     "types": ["vite/client"],
     "skipLibCheck": true,
 
-    /* Bundler mode */
     "moduleResolution": "bundler",
     "moduleDetection": "force",
     "noEmit": true,
