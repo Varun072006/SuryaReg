@@ -1,0 +1,23 @@
+{
+  "name": "suryareg-backend",
+  "version": "1.0.0",
+  "description": "Backend API & Database for SuryaReg (SELENE-REG) Lunar Image Registration Workstation",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "seed": "node src/database/seed.js"
+  },
+  "keywords": [
+    "chandrayaan-2",
+    "lunar",
+    "image-registration",
+    "sih26166",
+    "isro",
+    "subpixel",
+    "sqlite"
+  ],
+  "author": "SuryaReg Team",
+  "license": "MIT"
+}
