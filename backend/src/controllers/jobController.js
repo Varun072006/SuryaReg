@@ -1,34 +1,37 @@
 import repository from '../database/repository.js';
 import registrationEngine from '../services/registrationEngine.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import { JOB_STATUSES } from '../utils/constants.js';
+import logger from '../utils/logger.js';
 
-export const getJobs = (req, res) => {
+export const getJobs = (req, res, next) => {
   try {
     const jobs = repository.getAllJobs();
-    res.json({ success: true, count: jobs.length, data: jobs });
+    return sendSuccess(res, jobs, { count: jobs.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const getJobById = (req, res) => {
+export const getJobById = (req, res, next) => {
   try {
     const job = repository.getJobById(req.params.id);
     if (!job) {
-      return res.status(404).json({ success: false, error: 'Job not found' });
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
     }
-    res.json({ success: true, data: job });
+    return sendSuccess(res, job);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const createJob = (req, res) => {
+export const createJob = (req, res, next) => {
   try {
     const body = req.body || {};
     const pairId = body.pairId || body.pair_id || 'pair-ohrc-nac-demo';
     const pair = repository.getPairById(pairId);
     if (!pair) {
-      return res.status(400).json({ success: false, error: `Invalid pairId: ${pairId}` });
+      return sendError(res, `Invalid pairId: Target pairing '${pairId}' does not exist.`, 400, 'INVALID_PAIR_ID');
     }
 
     const allJobs = repository.getAllJobs();
@@ -39,7 +42,7 @@ export const createJob = (req, res) => {
       id: jobId,
       name: body.name || `Reg-${jobId.slice(-2)}: ${pair.region} (${pair.sourceDataset?.shortName} → ${pair.referenceDataset?.shortName})`,
       pair_id: pair.id,
-      status: 'queued',
+      status: JOB_STATUSES.QUEUED,
       current_stage_key: 'ingest',
       stage_step: 1,
       progress: 0,
@@ -64,7 +67,7 @@ export const createJob = (req, res) => {
 
     repository.insertJob(newJob);
 
-    // Initial log
+    // Initial Audit Log
     repository.insertJobLog({
       id: `log-init-${Date.now()}`,
       job_id: jobId,
@@ -72,107 +75,152 @@ export const createJob = (req, res) => {
       elapsed_sec: 0,
       level: 'engine',
       stage_key: 'ingest',
-      message: `Job ${jobId} queued for execution on workstation backend.`
+      message: `Job ${jobId} registered and queued for execution on SuryaReg workstation.`
     });
 
-    // Auto-start if requested
+    // Auto-start asynchronous execution if requested
     if (body.autoStart !== false) {
-      // Run asynchronously in background
-      registrationEngine.runJob(newJob, { fast: body.fastExecution || false }).catch(err => {
-        console.error(`[Engine] Error running job ${jobId}:`, err);
+      registrationEngine.runJob(newJob, { fast: Boolean(body.fastExecution) }).catch(err => {
+        logger.error(`[Engine] Background execution error for ${jobId}:`, err);
       });
     }
 
     const created = repository.getJobById(jobId);
-    res.status(201).json({ success: true, data: created });
+    return sendSuccess(res, created, { message: `Job ${jobId} successfully created.` }, 201);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const startJob = async (req, res) => {
+export const startJob = async (req, res, next) => {
   try {
     const job = repository.getJobById(req.params.id);
     if (!job) {
-      return res.status(404).json({ success: false, error: 'Job not found' });
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
     }
 
-    if (job.status === 'processing') {
-      return res.status(400).json({ success: false, error: 'Job is already processing' });
+    if (job.status === JOB_STATUSES.PROCESSING) {
+      return sendError(res, `Job '${job.id}' is already processing.`, 400, 'JOB_ALREADY_RUNNING');
     }
 
     // Launch execution asynchronously
-    registrationEngine.runJob(job, { fast: req.body?.fast || false }).catch(err => {
-      console.error(`[Engine] Execution error for job ${job.id}:`, err);
+    registrationEngine.runJob(job, { fast: Boolean(req.body?.fast) }).catch(err => {
+      logger.error(`[Engine] Execution failure for job ${job.id}:`, err);
     });
 
-    res.json({ success: true, message: `Job ${job.id} started`, data: job });
+    return sendSuccess(res, job, { message: `Job ${job.id} started execution.` });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const pauseJob = (req, res) => {
-  try {
-    const success = registrationEngine.pauseJob(req.params.id);
-    res.json({ success, message: success ? 'Job paused' : 'Job not currently active' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-};
-
-export const resumeJob = (req, res) => {
-  try {
-    const success = registrationEngine.resumeJob(req.params.id);
-    res.json({ success, message: success ? 'Job resumed' : 'Job not currently paused' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-};
-
-export const cancelJob = (req, res) => {
-  try {
-    const success = registrationEngine.cancelJob(req.params.id);
-    repository.updateJobStatus(req.params.id, 'needs-attention', 'Cancelled by user');
-    res.json({ success: true, message: 'Job cancelled' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-};
-
-export const retryJob = (req, res) => {
+export const pauseJob = (req, res, next) => {
   try {
     const job = repository.getJobById(req.params.id);
     if (!job) {
-      return res.status(404).json({ success: false, error: 'Job not found' });
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
     }
 
-    repository.updateJobStatus(job.id, 'queued', null);
-    registrationEngine.runJob(job).catch(err => {
-      console.error(`[Engine] Retry execution error:`, err);
+    if (job.status !== JOB_STATUSES.PROCESSING) {
+      return sendError(res, `Job '${job.id}' cannot be paused because its status is '${job.status}'.`, 400, 'INVALID_JOB_STATE');
+    }
+
+    const paused = registrationEngine.pauseJob(job.id);
+    return sendSuccess(res, { paused }, { message: paused ? `Job ${job.id} paused.` : `Could not pause job ${job.id}.` });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const resumeJob = (req, res, next) => {
+  try {
+    const job = repository.getJobById(req.params.id);
+    if (!job) {
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
+    }
+
+    if (job.status !== JOB_STATUSES.PAUSED) {
+      return sendError(res, `Job '${job.id}' cannot be resumed because it is not currently paused.`, 400, 'INVALID_JOB_STATE');
+    }
+
+    const resumed = registrationEngine.resumeJob(job.id);
+    return sendSuccess(res, { resumed }, { message: resumed ? `Job ${job.id} resumed.` : `Could not resume job ${job.id}.` });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const cancelJob = (req, res, next) => {
+  try {
+    const job = repository.getJobById(req.params.id);
+    if (!job) {
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
+    }
+
+    if (job.status === JOB_STATUSES.COMPLETED || job.status === JOB_STATUSES.FAILED) {
+      return sendError(res, `Job '${job.id}' has already reached terminal state '${job.status}'.`, 400, 'INVALID_JOB_STATE');
+    }
+
+    registrationEngine.cancelJob(job.id);
+    repository.updateJobStatus(job.id, JOB_STATUSES.NEEDS_ATTENTION, 'Cancelled by operator');
+
+    return sendSuccess(res, { cancelled: true }, { message: `Job ${job.id} has been cancelled.` });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const retryJob = (req, res, next) => {
+  try {
+    const job = repository.getJobById(req.params.id);
+    if (!job) {
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
+    }
+
+    repository.updateJobStatus(job.id, JOB_STATUSES.QUEUED, null);
+    registrationEngine.runJob(job, { fast: Boolean(req.body?.fast) }).catch(err => {
+      logger.error(`[Engine] Retry execution failure for job ${job.id}:`, err);
     });
 
-    res.json({ success: true, message: `Retrying job ${job.id}` });
+    return sendSuccess(res, { retried: true }, { message: `Retrying job ${job.id}.` });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const getJobLogs = (req, res) => {
+export const deleteJob = (req, res, next) => {
+  try {
+    const job = repository.getJobById(req.params.id);
+    if (!job) {
+      return sendError(res, `Job '${req.params.id}' was not found.`, 404, 'JOB_NOT_FOUND');
+    }
+
+    if (registrationEngine.isJobActive(job.id)) {
+      registrationEngine.cancelJob(job.id);
+    }
+
+    repository.deleteJob(job.id);
+    return sendSuccess(res, { deleted: true }, { message: `Job ${job.id} deleted successfully.` });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const getJobLogs = (req, res, next) => {
   try {
     const logs = repository.getJobLogs(req.params.id);
-    res.json({ success: true, count: logs.length, data: logs });
+    return sendSuccess(res, logs, { count: logs.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const getJobTiePoints = (req, res) => {
+export const getJobTiePoints = (req, res, next) => {
   try {
     const points = repository.getJobTiePoints(req.params.id);
-    res.json({ success: true, count: points.length, data: points });
+    return sendSuccess(res, points, { count: points.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
@@ -185,6 +233,7 @@ export default {
   resumeJob,
   cancelJob,
   retryJob,
+  deleteJob,
   getJobLogs,
   getJobTiePoints
 };

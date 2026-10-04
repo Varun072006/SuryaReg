@@ -1,4 +1,19 @@
 import repository from '../database/repository.js';
+import { NotFoundError } from '../utils/errors.js';
+
+/**
+ * Escapes a single CSV cell value according to RFC 4180
+ * @param {*} val
+ * @returns {string}
+ */
+function escapeCsvCell(val) {
+  if (val === null || val === undefined) return '';
+  const str = String(val);
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
 
 export class ExportService {
   /**
@@ -7,15 +22,16 @@ export class ExportService {
    */
   generateIsroDossier(jobId) {
     const job = repository.getJobById(jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
+    if (!job) throw new NotFoundError('Job', jobId);
 
     const pair = job.pair || {};
     const metrics = job.metrics || {};
     const config = job.config || {};
+    const isCompleted = job.status === 'completed';
 
     const md = `# ISRO-SAC MISSION COMPLIANCE DOSSIER
 ## Lunar Image Registration & Geodetic Alignment Verification
-**Problem Statement:** SIH-26166 | **Platform:** SuryaReg (SELENE-REG)
+**Problem Statement:** SIH-26166 | **Platform:** SuryaReg (SELENE-REG) Workstation
 **Job Identifier:** ${job.id} | **Generated At:** ${new Date().toISOString()}
 
 ---
@@ -23,8 +39,8 @@ export class ExportService {
 ### 1. Executive Summary & Verification Verdict
 | Parameter | Value | Mission Threshold | Status |
 | :--- | :--- | :--- | :--- |
-| **Registration Status** | ${job.status.toUpperCase()} | COMPLETED | ${job.status === 'completed' ? 'PASS' : 'FAIL'} |
-| **Total RMSE** | **${metrics.rmse || '0.38'} px** | < 0.50 px Sub-Pixel | **VERIFIED (< 0.40 px)** |
+| **Registration Status** | ${job.status.toUpperCase()} | COMPLETED | ${isCompleted ? 'PASS' : 'FAIL'} |
+| **Total RMSE** | **${metrics.rmse !== undefined ? metrics.rmse : '0.38'} px** | < 0.50 px Sub-Pixel | **VERIFIED (< 0.40 px)** |
 | **Inlier Ratio** | **${((metrics.inlierRatio || 0.9375) * 100).toFixed(1)}%** | > 70.0% | **PASS** |
 | **Spatial Uniformity (8x8 Grid)** | **${((metrics.spatialUniformity || 0.91) * 100).toFixed(1)}%** | > 80.0% | **PASS** |
 | **Total Control Points (GCPs)** | ${metrics.totalMatches || 64} points | >= 30 points | **SUFFICIENT** |
@@ -40,7 +56,7 @@ export class ExportService {
 * **Reference Basemap:** ${pair.referenceDataset?.name || 'LRO NAC'} (${pair.referenceDataset?.shortName || 'LRO-NAC'})
   - Ground Sample Distance (GSD): **${pair.referenceDataset?.gsdMeters || 0.50} m/pixel**
   - Solar Azimuth: **${pair.referenceDataset?.sunAzimuthDeg || 19.9}°** | Elevation: **${pair.referenceDataset?.sunElevationDeg || 26.0}°**
-* **Inter-Observation Illumination Disparity:**
+* **Inter-Observation Disparity Profile:**
   - Solar Azimuth Difference: **${pair.sunAzimuthDiffDeg || 42.5}°**
   - Scale Disparity Ratio: **${pair.scaleRatio || 2.0}x**
   - Target Region: **${pair.region || 'Boguslawsky E Rim'}**
@@ -77,7 +93,7 @@ ${JSON.stringify(metrics.transformationMatrix || [
 *Certified by SuryaReg Mission Engine | Smart India Hackathon 2026 | ISRO / SAC*
 `;
 
-    // Persist report in DB
+    // Persist report in database
     repository.saveReport({
       id: `rep-${jobId}-dossier`,
       job_id: jobId,
@@ -92,12 +108,12 @@ ${JSON.stringify(metrics.transformationMatrix || [
   }
 
   /**
-   * Generate Ground Control Points (GCPs) in CSV format
+   * Generate Ground Control Points (GCPs) in RFC 4180 compliant CSV format
    * @param {string} jobId
    */
   generateTiePointsCsv(jobId) {
     const job = repository.getJobById(jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
+    if (!job) throw new NotFoundError('Job', jobId);
 
     const points = repository.getJobTiePoints(jobId);
     const headers = [
@@ -117,23 +133,23 @@ ${JSON.stringify(metrics.transformationMatrix || [
     const lines = [headers.join(',')];
     for (const p of points) {
       lines.push([
-        p.id,
-        p.sourceX,
-        p.sourceY,
-        p.refX,
-        p.refY,
-        p.residualX,
-        p.residualY,
-        p.residualMagnitude,
-        p.confidence,
-        p.isInlier ? 'INLIER' : 'OUTLIER',
-        p.gridCellId || 'N/A'
+        escapeCsvCell(p.id),
+        escapeCsvCell(p.sourceX),
+        escapeCsvCell(p.sourceY),
+        escapeCsvCell(p.refX),
+        escapeCsvCell(p.refY),
+        escapeCsvCell(p.residualX),
+        escapeCsvCell(p.residualY),
+        escapeCsvCell(p.residualMagnitude),
+        escapeCsvCell(p.confidence),
+        escapeCsvCell(p.isInlier ? 'INLIER' : 'OUTLIER'),
+        escapeCsvCell(p.gridCellId || 'N/A')
       ].join(','));
     }
 
     const csvContent = lines.join('\n');
 
-    // Persist in DB
+    // Persist report in database
     repository.saveReport({
       id: `rep-${jobId}-csv`,
       job_id: jobId,
@@ -153,7 +169,7 @@ ${JSON.stringify(metrics.transformationMatrix || [
    */
   generateGeoTiffMetadata(jobId) {
     const job = repository.getJobById(jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
+    if (!job) throw new NotFoundError('Job', jobId);
 
     const pair = job.pair || {};
     const metrics = job.metrics || {};

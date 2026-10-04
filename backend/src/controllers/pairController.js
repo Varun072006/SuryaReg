@@ -1,40 +1,55 @@
 import repository from '../database/repository.js';
+import { sendSuccess, sendError } from '../utils/response.js';
 
-export const getPairs = (req, res) => {
+export const getPairs = (req, res, next) => {
   try {
     const pairs = repository.getAllPairs();
-    res.json({ success: true, count: pairs.length, data: pairs });
+    return sendSuccess(res, pairs, { count: pairs.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const getPairById = (req, res) => {
+export const getPairById = (req, res, next) => {
   try {
     const pair = repository.getPairById(req.params.id);
     if (!pair) {
-      return res.status(404).json({ success: false, error: 'Pair not found' });
+      return sendError(res, `Image pair '${req.params.id}' was not found.`, 404, 'PAIR_NOT_FOUND');
     }
-    res.json({ success: true, data: pair });
+    return sendSuccess(res, pair);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const createPair = (req, res) => {
+export const createPair = (req, res, next) => {
   try {
     const pair = req.body;
-    if (!pair.id || !pair.name || !pair.sourceDatasetId || !pair.referenceDatasetId) {
-      return res.status(400).json({
-        success: false,
-        error: 'id, name, sourceDatasetId, and referenceDatasetId are required'
-      });
+    const srcId = pair.sourceDatasetId || pair.source_dataset_id;
+    const refId = pair.referenceDatasetId || pair.reference_dataset_id;
+
+    if (!pair.id || !pair.name || !srcId || !refId) {
+      return sendError(
+        res,
+        'id, name, sourceDatasetId, and referenceDatasetId are required.',
+        400,
+        'VALIDATION_ERROR'
+      );
     }
+
+    if (!repository.datasetExists(srcId)) {
+      return sendError(res, `Source dataset '${srcId}' does not exist in archive.`, 400, 'SOURCE_DATASET_NOT_FOUND');
+    }
+
+    if (!repository.datasetExists(refId)) {
+      return sendError(res, `Reference dataset '${refId}' does not exist in archive.`, 400, 'REF_DATASET_NOT_FOUND');
+    }
+
     repository.insertPair(pair);
     const created = repository.getPairById(pair.id);
-    res.status(201).json({ success: true, data: created });
+    return sendSuccess(res, created, { message: `Image pair '${pair.id}' created successfully.` }, 201);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 

@@ -1,37 +1,39 @@
 import repository from '../database/repository.js';
+import { sendSuccess, sendError } from '../utils/response.js';
 
-export const getDatasets = (req, res) => {
+export const getDatasets = (req, res, next) => {
   try {
     const datasets = repository.getAllDatasets();
-    res.json({ success: true, count: datasets.length, data: datasets });
+    return sendSuccess(res, datasets, { count: datasets.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const getDatasetById = (req, res) => {
+export const getDatasetById = (req, res, next) => {
   try {
     const dataset = repository.getDatasetById(req.params.id);
     if (!dataset) {
-      return res.status(404).json({ success: false, error: 'Dataset not found' });
+      return sendError(res, `Dataset '${req.params.id}' was not found.`, 404, 'DATASET_NOT_FOUND');
     }
-    res.json({ success: true, data: dataset });
+    return sendSuccess(res, dataset);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
-export const createDataset = (req, res) => {
+export const createDataset = (req, res, next) => {
   try {
     const ds = req.body;
-    if (!ds.id || !ds.name) {
-      return res.status(400).json({ success: false, error: 'id and name are required' });
+    if (!ds || !ds.id || !ds.name) {
+      return sendError(res, 'Both id and name are required to register a dataset.', 400, 'VALIDATION_ERROR');
     }
+
     repository.insertDataset(ds);
     const created = repository.getDatasetById(ds.id);
-    res.status(201).json({ success: true, data: created });
+    return sendSuccess(res, created, { message: `Dataset '${ds.id}' registered successfully.` }, 201);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 

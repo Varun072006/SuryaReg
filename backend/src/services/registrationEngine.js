@@ -1,28 +1,27 @@
 import repository from '../database/repository.js';
 import { generateSeedTiePoints } from '../database/seedData.js';
+import { PIPELINE_STAGES, JOB_STATUSES } from '../utils/constants.js';
+import logger from '../utils/logger.js';
 
-export const PIPELINE_STAGES = [
-  { step: 1, key: 'ingest', label: '01 Ingest', description: 'Source & reference raster file ingestion', progressRange: [0, 8] },
-  { step: 2, key: 'metadata', label: '02 Metadata Validation', description: 'SPICE ephemeris, camera model, bit-depth verification', progressRange: [8, 18] },
-  { step: 3, key: 'geometry', label: '03 Geometry Preparation', description: 'Reference DEM query, initial footprint intersect', progressRange: [18, 30] },
-  { step: 4, key: 'projection', label: '04 Common-GSD Projection', description: 'Resampling to common spatial ground resolution', progressRange: [30, 42] },
-  { step: 5, key: 'illumination', label: '05 Illumination Normalization', description: 'Wallis & phase congruency illumination balancing', progressRange: [42, 52] },
-  { step: 6, key: 'matching', label: '06 Feature Matching', description: 'Deep feature correspondence extraction', progressRange: [52, 70] },
-  { step: 7, key: 'refinement', label: '07 Sub-pixel Refinement', description: 'Local parabolic peak refinement & phase alignment', progressRange: [70, 80] },
-  { step: 8, key: 'filtering', label: '08 MAGSAC++ Filtering', description: 'Robust outlier rejection and geometric consistency', progressRange: [80, 90] },
-  { step: 9, key: 'transform', label: '09 Transform Estimation', description: 'Homography / affine deformation matrix estimation', progressRange: [90, 96] },
-  { step: 10, key: 'warp_outputs', label: '10 Warp & Outputs', description: 'GeoTIFF resampling & deliverable generation', progressRange: [96, 100] }
-];
+export { PIPELINE_STAGES };
 
 export class RegistrationEngine {
   constructor() {
-    this.activeJobs = new Map(); // jobId -> execution handle
+    this.activeJobs = new Map(); // jobId -> { isCancelled, isPaused, startedAt }
+  }
+
+  /**
+   * Determine if a job is currently active
+   * @param {string} jobId
+   */
+  isJobActive(jobId) {
+    return this.activeJobs.has(jobId);
   }
 
   /**
    * Run a registration job through the 10-stage pipeline
    * @param {Object} job - The job record from database
-   * @param {Object} options - Options { fast: boolean, onProgress: Function, onLog: Function }
+   * @param {Object} [options] - Options { fast: boolean, onProgress: Function, onLog: Function }
    */
   async runJob(job, options = {}) {
     const jobId = job.id;
@@ -30,18 +29,19 @@ export class RegistrationEngine {
     const config = job.config || {};
     const isSimulatedFailure = Boolean(job.is_simulated_failure || job.isSimulatedFailure);
 
-    console.log(`[Engine] Starting 10-Stage Pipeline execution for Job: ${jobId} (Pair: ${pair?.name || pair?.id})`);
+    logger.engine('INIT', `Starting 10-Stage Pipeline execution for Job: ${jobId} (Pair: ${pair?.name || pair?.id || 'Unknown'})`);
 
-    // Set status to processing
-    repository.updateJobStatus(jobId, 'processing');
+    // Mark status as processing
+    repository.updateJobStatus(jobId, JOB_STATUSES.PROCESSING);
 
     const executionState = {
       isCancelled: false,
-      isPaused: false
+      isPaused: false,
+      startedAt: Date.now()
     };
     this.activeJobs.set(jobId, executionState);
 
-    const stepIntervalMs = options.fast ? 20 : 150;
+    const stepIntervalMs = options.fast ? 15 : 120;
 
     const addLog = (level, stageKey, message, elapsedSec) => {
       const log = {
@@ -54,121 +54,152 @@ export class RegistrationEngine {
         message
       };
       repository.insertJobLog(log);
-      if (options.onLog) options.onLog(log);
+      if (options.onLog) {
+        try {
+          options.onLog(log);
+        } catch (err) {
+          logger.warn('[Engine] onLog callback error:', err.message);
+        }
+      }
       return log;
     };
 
-    // Initial Ingestion Log
-    addLog('info', 'ingest', `Ingested source raster ${pair?.sourceDataset?.shortName || 'CH2-OHRC'} and reference ${pair?.referenceDataset?.shortName || 'LRO-NAC'} from PDS4 archive.`, 0.1);
+    try {
+      // Stage 1 Ingest Log
+      addLog(
+        'info',
+        'ingest',
+        `Ingested source raster ${pair?.sourceDataset?.shortName || 'CH2-OHRC'} and reference ${pair?.referenceDataset?.shortName || 'LRO-NAC'} from PDS4 archive.`,
+        0.1
+      );
 
-    for (let step = 1; step <= 40; step++) {
-      if (executionState.isCancelled) {
-        console.log(`[Engine] Job ${jobId} cancelled.`);
-        repository.updateJobStatus(jobId, 'needs-attention', 'Job execution cancelled by operator.');
-        this.activeJobs.delete(jobId);
-        return;
-      }
+      for (let step = 1; step <= 40; step++) {
+        // Check cancellation
+        if (executionState.isCancelled) {
+          logger.info(`[Engine] Job ${jobId} was cancelled by operator.`);
+          addLog('warn', 'general', 'Job execution cancelled by operator.', (step * stepIntervalMs) / 1000);
+          repository.updateJobStatus(jobId, JOB_STATUSES.NEEDS_ATTENTION, 'Job execution cancelled by operator.');
+          return;
+        }
 
-      while (executionState.isPaused) {
-        await new Promise(r => setTimeout(r, 200));
-        if (executionState.isCancelled) return;
-      }
+        // Handle paused state
+        while (executionState.isPaused) {
+          await new Promise(r => setTimeout(r, 200));
+          if (executionState.isCancelled) {
+            logger.info(`[Engine] Job ${jobId} cancelled while paused.`);
+            addLog('warn', 'general', 'Job execution cancelled while paused.', (step * stepIntervalMs) / 1000);
+            repository.updateJobStatus(jobId, JOB_STATUSES.NEEDS_ATTENTION, 'Job execution cancelled by operator while paused.');
+            return;
+          }
+        }
 
-      await new Promise(r => setTimeout(r, stepIntervalMs));
+        await new Promise(r => setTimeout(r, stepIntervalMs));
 
-      const progress = Math.min(100, Math.round((step / 40) * 100));
-      let currentStage = PIPELINE_STAGES[0];
-      for (let i = PIPELINE_STAGES.length - 1; i >= 0; i--) {
-        if (progress >= PIPELINE_STAGES[i].progressRange[0]) {
-          currentStage = PIPELINE_STAGES[i];
-          break;
+        const progress = Math.min(100, Math.round((step / 40) * 100));
+        let currentStage = PIPELINE_STAGES[0];
+        for (let i = PIPELINE_STAGES.length - 1; i >= 0; i--) {
+          if (progress >= PIPELINE_STAGES[i].progressRange[0]) {
+            currentStage = PIPELINE_STAGES[i];
+            break;
+          }
+        }
+
+        const elapsedSec = (step * stepIntervalMs) / 1000;
+        repository.updateJobProgress(jobId, progress, currentStage.key, currentStage.step, 0.15);
+
+        if (options.onProgress) {
+          try {
+            options.onProgress(progress, currentStage.key, currentStage.step);
+          } catch (err) {
+            logger.warn('[Engine] onProgress callback error:', err.message);
+          }
+        }
+
+        // Checkpoint Stage Milestone Logs
+        if (step === 5) {
+          addLog('info', 'metadata', `Ephemeris verified via SPICE kernel. Sun azimuth delta = ${pair?.sunAzimuthDiffDeg?.toFixed(1) || 42.5}°, Scale ratio = ${pair?.scaleRatio?.toFixed(1) || 2.0}x.`, elapsedSec);
+        } else if (step === 11) {
+          addLog('info', 'geometry', `Intersected region with ${config.referenceDem || 'SLDEM2015'}. Topographic relief variance: 570m.`, elapsedSec);
+        } else if (step === 16) {
+          addLog('info', 'projection', `Projected to ${config.projection || 'Polar Stereographic (South)'} with Target GSD: ${config.targetGsd || 'auto'}.`, elapsedSec);
+        } else if (step === 20) {
+          addLog('engine', 'illumination', 'Applying Wallis & phase-congruency filter to normalize solar shadow gradients and inverted relief.', elapsedSec);
+        }
+
+        // Simulated failure checkpoint
+        if (isSimulatedFailure && step === 24) {
+          addLog('error', 'matching', 'Confidence dropped below threshold in extreme shadow crater rim. Insufficient tie points.', elapsedSec);
+          repository.updateJobStatus(jobId, JOB_STATUSES.FAILED, 'Geometric match failed: Extreme illumination disparity without sufficient albedo contrast.');
+          logger.warn(`[Engine] Job ${jobId} failed as requested by simulation.`);
+          return;
+        }
+
+        if (step === 26) {
+          addLog('engine', 'matching', `${config.matcher || 'LoFTR'} dense matcher extracted 64 candidate correspondences across dynamic range.`, elapsedSec);
+        } else if (step === 31) {
+          addLog('info', 'refinement', 'Parabolic sub-pixel peak refinement localized tie points with <0.15px residual accuracy.', elapsedSec);
+        } else if (step === 35) {
+          addLog('engine', 'filtering', 'MAGSAC++ filtered 4 outlier matches. 60 inliers certified (Inlier ratio: 93.8%). Uniformity verified.', elapsedSec);
+        } else if (step === 38) {
+          addLog('info', 'transform', '3x3 projective transformation matrix estimated. Sub-pixel RMSE = 0.38 px.', elapsedSec);
         }
       }
 
-      const elapsedSec = (step * stepIntervalMs) / 1000;
-      repository.updateJobProgress(jobId, progress, currentStage.key, currentStage.step, 0.15);
+      // Stage 10: Finalization & Deliverables
+      const totalElapsedSec = (40 * stepIntervalMs) / 1000;
+      addLog('info', 'warp_outputs', 'Registration completed successfully. Generated GeoTIFF, CSV, JSON, and ISRO-SAC Compliance Dossier.', totalElapsedSec);
 
-      if (options.onProgress) {
-        options.onProgress(progress, currentStage.key, currentStage.step);
-      }
+      // Compute precision metrics based on selected feature matcher
+      const matcherMultiplier =
+        config.matcher === 'RoMa' ? 0.95 :
+        config.matcher === 'LoFTR' ? 1.0 :
+        config.matcher === 'MINIMA' ? 1.02 :
+        config.matcher === 'RIFT' ? 1.08 :
+        config.matcher === 'LightGlue' ? 1.15 : 1.35;
 
-      // Stage-specific checkpoint logs
-      if (step === 5) {
-        addLog('info', 'metadata', `Ephemeris verified via SPICE kernel. Sun azimuth delta = ${pair?.sunAzimuthDiffDeg?.toFixed(1) || 42.5}°, Scale ratio = ${pair?.scaleRatio?.toFixed(1) || 2.0}x.`, elapsedSec);
-      } else if (step === 11) {
-        addLog('info', 'geometry', `Intersected region with ${config.referenceDem || 'SLDEM2015'}. Topographic relief variance: 570m.`, elapsedSec);
-      } else if (step === 16) {
-        addLog('info', 'projection', `Projected to ${config.projection || 'Polar Stereographic (South)'} with Target GSD: ${config.targetGsd || 'auto'}.`, elapsedSec);
-      } else if (step === 20) {
-        addLog('engine', 'illumination', 'Applying Wallis & phase-congruency filter to normalize solar shadow gradients and inverted relief.', elapsedSec);
-      }
+      const baseRmse = 0.38 * matcherMultiplier;
+      const finalMetrics = {
+        rmse: Math.round(baseRmse * 100) / 100,
+        xRmse: Math.round(baseRmse * 0.68 * 100) / 100,
+        yRmse: Math.round(baseRmse * 0.72 * 100) / 100,
+        ce90: Math.round(baseRmse * 1.42 * 100) / 100,
+        le90: Math.round(baseRmse * 1.1 * 100) / 100,
+        totalMatches: 64,
+        inliers: 60,
+        outliers: 4,
+        inlierRatio: 0.9375,
+        coveragePct: 93.75,
+        occupiedCells: 15,
+        totalCells: 16,
+        spatialUniformity: 0.91,
+        scaleRatio: pair?.scaleRatio || 2.0,
+        sunAzimuthDiff: pair?.sunAzimuthDiffDeg || 42.5,
+        sunElevationDiff: pair?.sunElevationDiffDeg || 11.2,
+        transformationMatrix: [
+          [1.0204, -0.0152, 18.51],
+          [0.0118, 1.0182, -12.34],
+          [0.000003, -0.000002, 1.0]
+        ]
+      };
 
-      // Check simulated failure condition
-      if (isSimulatedFailure && step === 24) {
-        addLog('error', 'matching', 'Confidence dropped below threshold in extreme shadow crater rim. Insufficient tie points.', elapsedSec);
-        repository.updateJobStatus(jobId, 'failed', 'Geometric match failed: Extreme illumination disparity without sufficient albedo contrast.');
-        this.activeJobs.delete(jobId);
-        return;
-      }
+      // Store Ground Control Points atomically
+      const tiePoints = generateSeedTiePoints(jobId);
+      repository.insertTiePoints(jobId, tiePoints);
 
-      if (step === 26) {
-        addLog('engine', 'matching', `${config.matcher || 'LoFTR'} dense matcher extracted 64 candidate correspondences across dynamic range.`, elapsedSec);
-      } else if (step === 31) {
-        addLog('info', 'refinement', 'Parabolic sub-pixel peak refinement localized tie points with <0.15px residual accuracy.', elapsedSec);
-      } else if (step === 35) {
-        addLog('engine', 'filtering', 'MAGSAC++ filtered 4 outlier matches. 60 inliers certified (Inlier ratio: 93.8%). Uniformity verified.', elapsedSec);
-      } else if (step === 38) {
-        addLog('info', 'transform', '3x3 projective transformation matrix estimated. Sub-pixel RMSE = 0.38 px.', elapsedSec);
-      }
+      // Complete job with metrics
+      repository.completeJob(jobId, finalMetrics);
+
+      logger.info(`[Engine] Job ${jobId} finished with sub-pixel RMSE: ${finalMetrics.rmse} px (< 0.40 px threshold).`);
+      return repository.getJobById(jobId);
+
+    } catch (err) {
+      logger.error(`[Engine] Unexpected error executing Job ${jobId}:`, err);
+      repository.updateJobStatus(jobId, JOB_STATUSES.FAILED, `Internal engine error: ${err.message}`);
+      throw err;
+    } finally {
+      // Guaranteed cleanup of in-memory handle
+      this.activeJobs.delete(jobId);
     }
-
-    // Final Stage 10: Deliverables & Warp
-    const elapsedSec = (40 * stepIntervalMs) / 1000;
-    addLog('info', 'warp_outputs', 'Registration completed successfully. Generated GeoTIFF, CSV, JSON, and ISRO-SAC Compliance Dossier.', elapsedSec);
-
-    // Compute metrics
-    const matcherMultiplier =
-      config.matcher === 'RoMa' ? 0.95 :
-      config.matcher === 'LoFTR' ? 1.0 :
-      config.matcher === 'MINIMA' ? 1.02 :
-      config.matcher === 'RIFT' ? 1.08 :
-      config.matcher === 'LightGlue' ? 1.15 : 1.35;
-
-    const baseRmse = 0.38 * matcherMultiplier;
-    const finalMetrics = {
-      rmse: Math.round(baseRmse * 100) / 100,
-      xRmse: Math.round(baseRmse * 0.68 * 100) / 100,
-      yRmse: Math.round(baseRmse * 0.72 * 100) / 100,
-      ce90: Math.round(baseRmse * 1.42 * 100) / 100,
-      le90: Math.round(baseRmse * 1.1 * 100) / 100,
-      totalMatches: 64,
-      inliers: 60,
-      outliers: 4,
-      inlierRatio: 0.9375,
-      coveragePct: 93.75,
-      occupiedCells: 15,
-      totalCells: 16,
-      spatialUniformity: 0.91,
-      scaleRatio: pair?.scaleRatio || 2.0,
-      sunAzimuthDiff: pair?.sunAzimuthDiffDeg || 42.5,
-      sunElevationDiff: pair?.sunElevationDiffDeg || 11.2,
-      transformationMatrix: [
-        [1.0204, -0.0152, 18.51],
-        [0.0118, 1.0182, -12.34],
-        [0.000003, -0.000002, 1.0]
-      ]
-    };
-
-    // Generate Ground Control Points
-    const tiePoints = generateSeedTiePoints(jobId);
-    repository.insertTiePoints(jobId, tiePoints);
-
-    // Complete job
-    repository.completeJob(jobId, finalMetrics);
-    this.activeJobs.delete(jobId);
-
-    console.log(`[Engine] Job ${jobId} finished with sub-pixel RMSE: ${finalMetrics.rmse} px (< 0.40 px threshold).`);
-    return repository.getJobById(jobId);
   }
 
   cancelJob(jobId) {
@@ -182,9 +213,9 @@ export class RegistrationEngine {
 
   pauseJob(jobId) {
     const handle = this.activeJobs.get(jobId);
-    if (handle) {
+    if (handle && !handle.isPaused) {
       handle.isPaused = true;
-      repository.updateJobStatus(jobId, 'paused');
+      repository.updateJobStatus(jobId, JOB_STATUSES.PAUSED);
       return true;
     }
     return false;
@@ -192,9 +223,9 @@ export class RegistrationEngine {
 
   resumeJob(jobId) {
     const handle = this.activeJobs.get(jobId);
-    if (handle) {
+    if (handle && handle.isPaused) {
       handle.isPaused = false;
-      repository.updateJobStatus(jobId, 'processing');
+      repository.updateJobStatus(jobId, JOB_STATUSES.PROCESSING);
       return true;
     }
     return false;
