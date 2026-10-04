@@ -1,44 +1,58 @@
 import express from 'express';
-import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import apiRoutes from './routes/apiRoutes.js';
-import { DIST_DIR, IMG_DIR } from './config/index.js';
+import { DIST_DIR, IMG_DIR, IS_PRODUCTION } from './config/index.js';
+import { securityHeadersMiddleware, corsMiddleware, rateLimitMiddleware } from './middleware/security.js';
+import { notFoundHandler, globalErrorHandler } from './middleware/errorHandler.js';
+import logger from './utils/logger.js';
 
 export function createApp() {
   const app = express();
 
-  // Middleware
-  app.use(cors());
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  // 1. Security Headers & Hardening
+  app.use(securityHeadersMiddleware);
 
-  // Request logger
+  // 2. CORS Handling
+  app.use(corsMiddleware);
+
+  // 3. Body Parsers with reasonable bounds to prevent DoS
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+  // 4. Rate Limiter for API endpoints
+  app.use(rateLimitMiddleware);
+
+  // 5. Request Logger & Performance Profiler
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api')) {
-      console.log(`[API] ${req.method} ${req.path}`);
-    }
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      if (req.path.startsWith('/api')) {
+        logger.info(`${req.method} ${req.originalUrl} [${res.statusCode}] - ${duration}ms`);
+      }
+    });
     next();
   });
 
-  // Mount API router
+  // 6. Mount Primary API Router
   app.use('/api', apiRoutes);
 
-  // Serve static imagery from img/ and dist/images
+  // 7. Serve Static Mission Imagery
   if (fs.existsSync(IMG_DIR)) {
-    app.use('/images', express.static(IMG_DIR));
+    app.use('/images', express.static(IMG_DIR, { maxAge: IS_PRODUCTION ? '1d' : '0' }));
   }
   const distImages = path.join(DIST_DIR, 'images');
   if (fs.existsSync(distImages)) {
-    app.use('/images', express.static(distImages));
+    app.use('/images', express.static(distImages, { maxAge: IS_PRODUCTION ? '1d' : '0' }));
   }
 
-  // Serve static frontend from dist
+  // 8. Serve Static Frontend SPA from dist
   if (fs.existsSync(DIST_DIR)) {
-    console.log(`[Static] Serving frontend static assets from: ${DIST_DIR}`);
+    logger.info(`[Static] Serving frontend static assets from: ${DIST_DIR}`);
     app.use(express.static(DIST_DIR));
 
-    // SPA fallback: any non-API route returns dist/index.html
+    // SPA fallback: any non-API GET route returns dist/index.html
     app.use((req, res, next) => {
       if (req.method === 'GET' && !req.path.startsWith('/api')) {
         return res.sendFile(path.join(DIST_DIR, 'index.html'));
@@ -46,17 +60,14 @@ export function createApp() {
       next();
     });
   } else {
-    console.warn(`[Static] Warning: dist directory not found at ${DIST_DIR}`);
+    logger.warn(`[Static] Production build directory not found at ${DIST_DIR}. Serving API-only mode.`);
   }
 
-  // Global error handler
-  app.use((err, req, res, next) => {
-    console.error('[Error]', err);
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal Server Error'
-    });
-  });
+  // 9. 404 Handler for Unmatched API Endpoints
+  app.use(notFoundHandler);
+
+  // 10. Global Centralized Error Handler
+  app.use(globalErrorHandler);
 
   return app;
 }

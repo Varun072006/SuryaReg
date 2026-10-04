@@ -1,7 +1,9 @@
 import repository from '../database/repository.js';
-import { DB_PATH } from '../config/index.js';
+import { DB_PATH, NODE_ENV } from '../config/index.js';
+import { sendSuccess } from '../utils/response.js';
+import { MISSION_METRICS } from '../utils/constants.js';
 
-export const getTelemetry = (req, res) => {
+export const getTelemetry = (req, res, next) => {
   try {
     const jobs = repository.getAllJobs();
     const datasets = repository.getAllDatasets();
@@ -12,39 +14,55 @@ export const getTelemetry = (req, res) => {
     const failedJobs = jobs.filter(j => j.status === 'failed');
 
     const totalRmse = completedJobs.reduce((acc, j) => acc + (j.metrics?.rmse || 0), 0);
-    const avgRmse = completedJobs.length > 0 ? Math.round((totalRmse / completedJobs.length) * 100) / 100 : 0.38;
+    const avgRmse = completedJobs.length > 0
+      ? Math.round((totalRmse / completedJobs.length) * 100) / 100
+      : 0.38;
 
-    res.json({
-      success: true,
-      data: {
-        platform: 'SELENE-REG / SuryaReg Workstation',
-        version: '1.0.0-SIH26166',
-        isro_compliant: true,
-        sub_pixel_threshold_px: 0.40,
-        current_avg_rmse_px: avgRmse,
-        active_jobs_count: activeJobs.length,
-        completed_jobs_count: completedJobs.length,
-        failed_jobs_count: failedJobs.length,
-        total_jobs_count: jobs.length,
-        total_datasets_count: datasets.length,
-        total_pairs_count: pairs.length,
-        database: {
-          type: 'SQLite (node:sqlite WAL Mode)',
-          path: DB_PATH,
-          connected: true
-        },
-        uptime_seconds: process.uptime(),
-        timestamp: new Date().toISOString()
+    const mem = process.memoryUsage();
+
+    return sendSuccess(res, {
+      platform: 'SuryaReg (SELENE-REG) Lunar Image Registration Workstation',
+      version: '1.2.0-SIH26166',
+      environment: NODE_ENV,
+      isro_compliant: true,
+      sub_pixel_threshold_px: MISSION_METRICS.SUBPIXEL_THRESHOLD_PX,
+      current_avg_rmse_px: avgRmse,
+      mission_summary: {
+        active_jobs: activeJobs.length,
+        completed_jobs: completedJobs.length,
+        failed_jobs: failedJobs.length,
+        total_jobs: jobs.length,
+        total_datasets: datasets.length,
+        total_pairs: pairs.length,
+        archived_datasets: datasets.length,
+        benchmark_pairs: pairs.length
+      },
+      system_telemetry: {
+        node_version: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        uptime_seconds: Math.round(process.uptime()),
+        memory_mb: {
+          rss: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
+          heap_used: Math.round((mem.heapUsed / 1024 / 1024) * 10) / 10,
+          heap_total: Math.round((mem.heapTotal / 1024 / 1024) * 10) / 10
+        }
+      },
+      database: {
+        engine: 'SQLite (node:sqlite WAL Mode)',
+        path: DB_PATH,
+        status: 'CONNECTED'
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 
 export const getHealth = (req, res) => {
-  res.json({
-    status: 'UP',
+  return res.status(200).json({
+    status: 'HEALTHY',
+    service: 'suryareg-mission-backend',
     database: 'CONNECTED',
     timestamp: new Date().toISOString()
   });

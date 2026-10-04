@@ -1,11 +1,12 @@
 import repository from '../database/repository.js';
+import { sendSuccess } from '../utils/response.js';
 
-export const getBenchmarks = (req, res) => {
+export const getBenchmarks = (req, res, next) => {
   try {
     const benchmarks = repository.getAllBenchmarks();
-    res.json({ success: true, count: benchmarks.length, data: benchmarks });
+    return sendSuccess(res, benchmarks, { count: benchmarks.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    next(err);
   }
 };
 

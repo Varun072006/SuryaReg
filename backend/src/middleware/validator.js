@@ -136,7 +136,7 @@ export function sanitizeFilename(filename) {
   if (!filename || typeof filename !== 'string') return 'download.bin';
   return filename
     .replace(/[\r\n]/g, '') // Remove CRLF
-    .replace(/[\/\\?%*:|"<>]/g, '_') // Remove traversal & unsafe chars
+    .replace(/[/\\?%*:|"<>]/g, '_') // Remove traversal & unsafe chars
     .trim()
     .slice(0, 100);
 }

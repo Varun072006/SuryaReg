@@ -9,6 +9,7 @@
     "dev:backend": "node --watch backend/server.js",
     "db:seed": "node backend/src/database/seed.js",
     "dev": "node backend/server.js",
+    "test": "node --test backend/tests/api.test.js",
     "preview": "vite preview",
     "lint": "oxlint"
   },
